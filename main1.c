@@ -8,11 +8,11 @@
 #include <time.h>
 
 #define MAX_CHAIRS 40
-#define MAX_SKIER_COUNT 120
-#define MAX_TICKETS 200
+#define MAX_SKIER_COUNT 12
+#define MAX_TICKETS 10
 #define MAX_PEOPLE_ON_PLATFORM 50
-#define OPENING_HOUR 8
-#define CLOSING_HOUR 18
+#define SIMULATION_DURATION 1 // Czas symulacji w sekundach
+#define MAX_ACTIVE_THREADS 10  // Maksymalna liczba aktywnych wątków naraz
 
 typedef struct {
     int ticket_id;
@@ -44,6 +44,7 @@ pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 Statistics stats = {0};
 volatile bool is_lift_running = true;
 volatile bool is_station_open = true;
+volatile int active_threads = 0;  // Liczba aktywnych wątków
 
 void perror_exit(const char* message) {
     perror(message);
@@ -75,45 +76,57 @@ void* skier_thread(void* arg) {
         return NULL;
     }
 
-    if (!is_ticket_valid(skier->ticket)) {
-        printf("Karnet narciarza #%d jest nieważny.\n", skier->skier_id);
-        free(skier);
-        return NULL;
+    while (is_ticket_valid(skier->ticket)) {
+        int gate = skier->ticket->is_vip ? 0 : rand() % 4;
+
+        if (sem_wait(&ticket_office_sem) == -1) {
+            perror("Błąd sem_wait na ticket_office_sem");
+            break;
+        }
+        sem_post(&ticket_office_sem);
+
+        if (sem_wait(&platform_sem) == -1) {
+            perror("Błąd sem_wait na platform_sem");
+            break;
+        }
+
+        pthread_mutex_lock(&stats_mutex);
+        stats.gate_count[gate]++;
+        stats.total_skiers++;
+        if (skier->age >= 4 && skier->age <= 8) {
+            stats.children_4_8++;
+        }
+        pthread_mutex_unlock(&stats_mutex);
+
+        printf("Narciarz #%d wszedł przez bramkę #%d.\n", skier->skier_id, gate);
+
+        if (sem_wait(&chairlift_sem) == -1) {
+            perror("Błąd sem_wait na chairlift_sem");
+            break;
+        }
+        printf("Narciarz #%d wsiadł na krzesełko.\n", skier->skier_id);
+        usleep(200000); // Skrócony czas symulacji przejazdu (200ms)
+        sem_post(&chairlift_sem);
+
+        int slope = rand() % 3;
+        usleep((slope + 1) * 200000); // Skrócony czas zjazdu
+
+        pthread_mutex_lock(&stats_mutex);
+        stats.slope_count[slope]++;
+        skier->ticket->usage_count++;
+        pthread_mutex_unlock(&stats_mutex);
+
+        printf("Narciarz #%d zjechał trasą #%d.\n", skier->skier_id, slope);
+        sem_post(&platform_sem);
+
+        usleep(rand() % 500000); // Symulacja odpoczynku między zjazdami
     }
 
-    int gate = skier->ticket->is_vip ? 0 : rand() % 4;
-
-    sem_wait(&ticket_office_sem);
-    sem_post(&ticket_office_sem);
-
-    sem_wait(&platform_sem);
-    pthread_mutex_lock(&stats_mutex);
-    stats.gate_count[gate]++;
-    stats.total_skiers++;
-    if (skier->age >= 4 && skier->age <= 8) {
-        stats.children_4_8++;
-    }
-    pthread_mutex_unlock(&stats_mutex);
-
-    printf("Narciarz #%d wszedł przez bramkę #%d.\n", skier->skier_id, gate);
-
-    sem_wait(&chairlift_sem);
-    printf("Narciarz #%d wsiadł na krzesełko.\n", skier->skier_id);
-    sleep(2);
-    sem_post(&chairlift_sem);
-
-    int slope = rand() % 3;
-    sleep(slope + 1);
-
-    pthread_mutex_lock(&stats_mutex);
-    stats.slope_count[slope]++;
-    skier->ticket->usage_count++;
-    pthread_mutex_unlock(&stats_mutex);
-
-    printf("Narciarz #%d zjechał trasą #%d.\n", skier->skier_id, slope);
-    sem_post(&platform_sem);
-
+    printf("Narciarz #%d zakończył korzystanie z karnetu.\n", skier->skier_id);
     free(skier);
+
+    // Zmniejszamy licznik aktywnych wątków
+    __sync_fetch_and_sub(&active_threads, 1);
     return NULL;
 }
 
@@ -130,9 +143,19 @@ void handle_sigusr2(int sig) {
 void setup_signal_handlers() {
     struct sigaction sa1, sa2;
     sa1.sa_handler = handle_sigusr1;
+    sigemptyset(&sa1.sa_mask);
+    sa1.sa_flags = 0;
+
     sa2.sa_handler = handle_sigusr2;
-    sigaction(SIGUSR1, &sa1, NULL);
-    sigaction(SIGUSR2, &sa2, NULL);
+    sigemptyset(&sa2.sa_mask);
+    sa2.sa_flags = 0;
+
+    if (sigaction(SIGUSR1, &sa1, NULL) == -1) {
+        perror_exit("Błąd ustawienia handlera SIGUSR1");
+    }
+    if (sigaction(SIGUSR2, &sa2, NULL) == -1) {
+        perror_exit("Błąd ustawienia handlera SIGUSR2");
+    }
 }
 
 void init_tickets() {
@@ -143,6 +166,7 @@ void init_tickets() {
         tickets[i].expiry_time = time(NULL) + (rand() % 3 + 1) * 3600;
     }
 }
+
 void generate_daily_report() {
     FILE* report_file = fopen("daily_report.txt", "w");
     if (!report_file) {
@@ -161,22 +185,17 @@ void generate_daily_report() {
         fprintf(report_file, "  Trasa #%d: %d zjazdów\n", i, stats.slope_count[i]);
     }
 
-    fprintf(report_file, "\nStatystyki karnetów:\n");
-    for (int i = 0; i < MAX_TICKETS; i++) {
-        fprintf(report_file, "  Karnet #%d: %d zjazdów\n", tickets[i].ticket_id, tickets[i].usage_count);
-    }
-
     fprintf(report_file, "\nStatystyki narciarzy:\n");
     fprintf(report_file, "  Łączna liczba narciarzy: %d\n", stats.total_skiers);
-    fprintf(report_file, "  Liczba dzieci w wieku 4-8 lat (z opiekunem): %d\n", stats.children_4_8);
-    fprintf(report_file, "  Liczba dzieci w wieku 4-8 lat (odrzucone): %d\n", stats.children_4_8 - stats.total_skiers);
+    fprintf(report_file, "  Liczba dzieci w wieku 4-8 lat: %d\n", stats.children_4_8);
     fclose(report_file);
     printf("Raport dzienny zapisano do pliku 'daily_report.txt'.\n");
 }
+
 void close_station() {
     printf("Stacja jest zamknięta. Przetransportowanie ostatnich osób...\n");
     while (sem_trywait(&platform_sem) == 0) {
-        sleep(2);
+        usleep(200000); // Skrócony czas transportu
     }
     printf("Wszystkie osoby zostały przetransportowane. Wyłączanie kolejki linowej.\n");
     is_station_open = false;
@@ -186,43 +205,54 @@ int main() {
     srand(time(NULL));
     init_tickets();
 
-    sem_init(&platform_sem, 0, MAX_PEOPLE_ON_PLATFORM);
-    sem_init(&chairlift_sem, 0, MAX_CHAIRS);
-    sem_init(&ticket_office_sem, 0, 1);
+    if (sem_init(&platform_sem, 0, MAX_PEOPLE_ON_PLATFORM) == -1) {
+        perror_exit("Błąd inicjalizacji semafora platform_sem");
+    }
+    if (sem_init(&chairlift_sem, 0, MAX_CHAIRS) == -1) {
+        perror_exit("Błąd inicjalizacji semafora chairlift_sem");
+    }
+    if (sem_init(&ticket_office_sem, 0, 1) == -1) {
+        perror_exit("Błąd inicjalizacji semafora ticket_office_sem");
+    }
 
-    pthread_t threads[MAX_SKIER_COUNT];
     setup_signal_handlers();
 
     printf("Stacja narciarska jest otwarta!\n");
 
-    time_t current_time;
-    struct tm* time_info;
+    time_t simulation_end_time = time(NULL) + SIMULATION_DURATION;
+
+    pthread_t threads[MAX_SKIER_COUNT];
 
     for (int i = 0; i < MAX_SKIER_COUNT; i++) {
-        current_time = time(NULL);
-        time_info = localtime(&current_time);
-
-        if (time_info->tm_hour >= CLOSING_HOUR) {
+        if (time(NULL) >= simulation_end_time) {
+            printf("Czas symulacji upłynął. Kończenie tworzenia nowych narciarzy.\n");
             break;
         }
 
-        if (!is_lift_running) {
-            sleep(1);
-            continue;
+        // Czekamy, jeśli aktywnych wątków jest już MAX_ACTIVE_THREADS
+        while (active_threads >= MAX_ACTIVE_THREADS) {
+            usleep(50000);  // Czekamy 50 ms, aby dać czas na zakończenie wątków
         }
 
         Skier* skier = (Skier*)malloc(sizeof(Skier));
+        if (!skier) {
+            perror_exit("Błąd alokacji pamięci dla narciarza");
+        }
+
         skier->skier_id = i + 1;
         skier->age = rand() % 75 + 4;
         skier->is_guardian = (skier->age >= 18 && skier->age <= 65 && rand() % 2);
         skier->children_count = skier->is_guardian ? rand() % 3 : 0;
         skier->ticket = &tickets[rand() % MAX_TICKETS];
 
+        // Zwiększamy licznik aktywnych wątków
+        __sync_fetch_and_add(&active_threads, 1);
+
         if (pthread_create(&threads[i], NULL, skier_thread, skier) != 0) {
             perror_exit("Nie udało się utworzyć wątku dla narciarza");
         }
 
-        usleep(rand() % 500000);
+        usleep(rand() % 100000); // Symulacja odpoczynku
     }
 
     for (int i = 0; i < MAX_SKIER_COUNT; i++) {

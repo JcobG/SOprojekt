@@ -10,12 +10,11 @@
 #include <sys/shm.h>
 #include <sys/msg.h>
 #include <signal.h>
+#include "ticket.h"
 
 #define MAX_CHAIRS 40         // Liczba krzesełek
 #define MAX_PEOPLE_ON_CHAIR 3 // Liczba miejsc na jednym krzesełku
 #define MAX_PEOPLE_ON_PLATFORM 50 // Maksymalna liczba osób na peronie
-#define OPENING_HOUR 8
-#define CLOSING_HOUR 10
 #define SIMULATION_STEP 1 // 1 sekunda = 1 minuta w symulacji
 
 // Dodanie tras
@@ -28,16 +27,14 @@
 volatile int simulated_time = 0; 
 volatile bool is_station_open = true;
 volatile bool is_lift_running = true;
-volatile int people_on_lift = 0;
 volatile int skiers_on_platform = 0;
 volatile int skiers_in_lift_queue = 0;
+
 // Semafory
 sem_t platform_sem;
 sem_t chairlift_sem;
-sem_t lift_control_sem;
 sem_t vip_chairlift_sem; // Semafor dla osób VIP
 sem_t gates[NUM_GATES]; // Semafory dla bramek
-
 sem_t gate_ready[NUM_GATES]; // Semafory wskazujące, że bramka jest gotowa
 
 
@@ -45,24 +42,17 @@ sem_t gate_ready[NUM_GATES]; // Semafory wskazujące, że bramka jest gotowa
 pthread_mutex_t lift_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t station_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t lift_condition = PTHREAD_COND_INITIALIZER;
-pthread_mutex_t chairlift_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t lift_operation_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex do synchronizacji operacji
+pthread_mutex_t lift_operation_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Watki
 pthread_t worker_thread_id,responder_thread_id, time_thread, lift_shutdown,skier_thread_id;
 pthread_t gate_threads[NUM_GATES];
+
 // Struktura komunikatu
 typedef struct {
     long message_type; // Typ komunikatu
     char message_text[100]; // Treść komunikatu
 } Message;
-
-// Struktura karnetu (biletu)
-typedef struct {
-    int ticket_id;      // ID karnetu
-    int usage_count;    // Liczba wykorzystanych przejazdów
-    bool is_vip;        // Czy bilet jest VIP?
-    int expiry_time;    // Czas ważności karnetu w minutach
-} Ticket;
 
 // Struktura narciarza
 typedef struct {
@@ -79,38 +69,13 @@ typedef struct {
 // Wskaźnik do pamięci dzielonej
 int* shared_usage;
 int shm_id; // Globalna zmienna dla ID pamięci dzielonej
+
 // ID kolejki komunikatów
 int msgid;
 
-// Zakup biletu
-Ticket* purchase_ticket(int skier_id, int age) {
-    Ticket* ticket = malloc(sizeof(Ticket));
-    if (!ticket) { // Sprawdzenie alokacji
-        fprintf(stderr, "Błąd: Nie udało się przydzielić pamięci dla biletu narciarza #%d.\n", skier_id);
-        return NULL; // Zwrócenie NULL, aby zgłosić błąd
-    }
-
-    ticket->ticket_id = skier_id;
-    ticket->usage_count = 0;
-
-    int ticket_type = rand() % 4;
-    if (ticket_type == 3) {
-        ticket->expiry_time = (CLOSING_HOUR - OPENING_HOUR) * 60; // Bilet dzienny
-    } else {
-        ticket->expiry_time = (ticket_type + 1) * 60; // Tk1, Tk2, Tk3
-    }
-
-    ticket->is_vip = rand() % 5 == 0; // 20% szans na VIP
-
-    if (age < 12 || age > 65) {
-        printf("\033[33mNarciarz #%d otrzymal znizke na karnet.\n\033[0m", skier_id);
-    }
-
-    return ticket;
-}
-
 // Funkcja zatrzymująca kolejkę linową
 void stop_lift(int worker_id) {
+
     pthread_mutex_lock(&lift_mutex);
     if (is_lift_running) {
         is_lift_running = false;
@@ -119,8 +84,9 @@ void stop_lift(int worker_id) {
     }
     pthread_mutex_unlock(&lift_mutex);
 }
-
+// Funkcja wznawiając kolejkę linową
 void resume_lift(int worker_id) {
+
     pthread_mutex_lock(&lift_mutex);
     if (!is_lift_running) {
         is_lift_running = true;
@@ -130,7 +96,9 @@ void resume_lift(int worker_id) {
     pthread_mutex_unlock(&lift_mutex);
 }
 
+// Wątek bramki
 void* gate_thread(void* arg) {
+
     int gate_id = *(int*)arg;
     free(arg);
 
@@ -155,6 +123,7 @@ void* gate_thread(void* arg) {
 
 // Symulacja czasu
 void* time_simulation_thread(void* arg) {
+
     int simulation_duration = (CLOSING_HOUR - OPENING_HOUR) * 60;
 
     while (simulated_time < simulation_duration) {
@@ -177,6 +146,7 @@ void* time_simulation_thread(void* arg) {
 
 // Funkcja obslugi dzieci i opiekunów
 bool can_ski(Skier* skier) {
+
     if (skier->is_child) {
         if (!skier->has_guardian) {
             printf("Narciarz #%d to dziecko, ktore nie ma opiekuna i nie może korzystać z kolejki.\n", skier->skier_id);
@@ -191,6 +161,7 @@ bool can_ski(Skier* skier) {
 
 // Funkcja wątku narciarza
 void* skier_thread(void* arg) {
+
     Skier* skier = (Skier*)arg;
 
     if (!can_ski(skier)) {
@@ -200,18 +171,21 @@ void* skier_thread(void* arg) {
     }
 
     while (simulated_time < skier->ticket->expiry_time && is_station_open) {
-         if (!is_station_open) break;
+       if (!is_station_open) break;
+
 	// Oczekiwanie na miejsce na platformie
 	 int gate_id = rand() % NUM_GATES;
 	 printf("\033[42mNarciarz #%d wchodzi przez bramke #%d.\033[0m\n", skier->skier_id, gate_id);
         sem_post(&gates[gate_id]); // Wysłanie narciarza do bramki
-	sem_wait(&gate_ready[gate_id]);
+	 sem_wait(&gate_ready[gate_id]);
         pthread_mutex_lock(&station_mutex);
+
         if (!is_station_open) {
             printf("Narciarz #%d nie moze wejsc na platformee, stacja jest zamknieta.\n", skier->skier_id);
             pthread_mutex_unlock(&station_mutex);
             break;
         }
+
         pthread_mutex_unlock(&station_mutex);
  	 sem_wait(&platform_sem);   // Oczekiwanie na wejście na platformę
 
@@ -236,36 +210,41 @@ void* skier_thread(void* arg) {
         }
 
         // Narciarz wsiada na krzeselko
-//        sem_wait(&chairlift_sem);
+
         __sync_add_and_fetch(&skiers_in_lift_queue, 1); // Zwiekszenie liczby narciarzy w kolejce
         pthread_mutex_lock(&lift_operation_mutex);
+
         while (!is_lift_running) {
             printf("Narciarz #%d czeka na wznowienie kolejki przed wsiadaniem.\n", skier->skier_id);
             pthread_cond_wait(&lift_condition, &lift_operation_mutex);
         }
+
 	if(!skier->ticket->is_vip){
         printf("\033[42mNarciarz #%d wsiada na krzeselko.\033[0m\n", skier->skier_id);
-        }
+       }
 	pthread_mutex_unlock(&lift_operation_mutex);
 
         // Symulacja jazdy
 	int ride_time = 5;  
-      for (int t = 0; t < ride_time; t++) {
+	for (int t = 0; t < ride_time; t++) {
+
             pthread_mutex_lock(&lift_operation_mutex);
             while (!is_lift_running) {
                 printf("Narciarz #%d zatrzymuje sie na krzeselku i czeka na wznowienie.\n", skier->skier_id);
                 pthread_cond_wait(&lift_condition, &lift_operation_mutex);
             }
             pthread_mutex_unlock(&lift_operation_mutex);
-            sleep(1); // Symulacja jednej sekundy jazdy
+            sleep(1);
         }
 
         // Narciarz konczy jazdę
         pthread_mutex_lock(&lift_operation_mutex);
+
         while (!is_lift_running) {
             printf("Narciarz #%d czeka na wznowienie kolejki przed zejsciem.\n", skier->skier_id);
             pthread_cond_wait(&lift_condition, &lift_operation_mutex);
         }
+
         printf("Narciarz #%d konczy jazde krzeselkiem i schodzi z platformy.\n", skier->skier_id);
         pthread_mutex_unlock(&lift_operation_mutex);
 
@@ -298,12 +277,15 @@ void* skier_thread(void* arg) {
     free(skier);
     return NULL;
 }
+//Wątek pracownika
 void* worker_thread(void* arg) {
+
     int worker_id = *(int*)arg;
     free(arg);
 
     while (is_station_open) {
         if (rand() % 10 == 0) { // 10% szans na zatrzymanie kolejki
+
             Message msg;
             msg.message_type = 1; // Prośba o gotowość
             snprintf(msg.message_text, sizeof(msg.message_text), "\033[33mPracownik #%d zatrzymuje kolejke.\033[0m", worker_id);
@@ -319,13 +301,16 @@ void* worker_thread(void* arg) {
             resume_lift(worker_id);
         }
         sleep(1); // Czas pracy pracownika
+
     }
 
     printf("\033[33m[Pracownik #%d] Konczy prace.\033[0m\n", worker_id);
     return NULL;
 }
+
 // Zakonczenie pracy kolejki po ostatnim narciarzu
 void* lift_shutdown_thread(void* arg) {
+
     while (is_station_open || skiers_on_platform > 0 || skiers_in_lift_queue > 0) {
         sleep(1); // Sprawdzaj co sekunde
     }
@@ -341,11 +326,14 @@ void* lift_shutdown_thread(void* arg) {
     printf("\033[41mKolejka zostala zatrzymana.\033[0m\n");
     return NULL;
 }
+// Wątek pracownika w komunikacji z drugim
 void* responder_thread(void* arg) {
+
     int worker_id = *(int*)arg;
     free(arg);
 
     while (is_station_open) {
+
         Message msg;
         msgrcv(msgid, &msg, sizeof(msg), 1, 0);
 
@@ -355,7 +343,7 @@ void* responder_thread(void* arg) {
             break;
         }
 
-        printf("\033[33mmPracownik #%d otrzymal komunikat: %s\n\033[0m", worker_id, msg.message_text);
+        printf("\033[33mPracownik #%d otrzymal komunikat: %s\n\033[0m", worker_id, msg.message_text);
         sleep(2); // Symulacja sprawdzania gotowosci
 
         msg.message_type = 2; // Odpowiedz do Pracownika 1
@@ -365,6 +353,8 @@ void* responder_thread(void* arg) {
 
     return NULL;
 }
+
+//Obsługa sygnału SIGUSR2
 void statistic_signal_handler(int signum) {
 	if (signum == SIGUSR2) {
    	 printf("\n[INFO] Otrzymano sygnał SIGUSR2. Generowanie raportu diagnostycznego...\n");
@@ -374,6 +364,8 @@ void statistic_signal_handler(int signum) {
    	 printf("- Narciarze w kolejce: %d\n", skiers_in_lift_queue);          
          }
 }
+
+//Zamknięcie używanych mechanizmów i pamięci 
 void cleanup(int signum) {
 
     printf("\nZatrzymano program. Zwolnienie zasobow...\n");
@@ -383,7 +375,7 @@ pthread_mutex_lock(&station_mutex);
 
 
 
-    // Odblokowanie wszystkich wątków oczekujących na semafory
+    // Odblokowanie wszystkich watkow oczekujacych na semafory
     for (int i = 0; i < NUM_GATES; i++) {
         sem_post(&gates[i]);
     }
@@ -408,7 +400,7 @@ pthread_mutex_lock(&station_mutex);
         pthread_join(gate_threads[i], NULL);
     }    
 
-        // Zwolnienie pami   ^yci dzielonej
+        // Zwolnienie pamieci dzielonej
     if (shmdt(shared_usage) == -1) {
         fprintf(stderr, "Blad: Nie udalo sie odlaczyc pamieci dzielonej.\n");
     }
@@ -416,7 +408,7 @@ pthread_mutex_lock(&station_mutex);
         fprintf(stderr, "Blad: Nie udalo sie usunac segmentu pamieci dzielonej.\n");
     }
 
-    // Usuni   ^ycie kolejki komunikat      w
+    // Usuniecie kolejki komunikatow
     if (msgctl(msgid, IPC_RMID, NULL) == -1) {
         fprintf(stderr, "Blad: Nie udalo sie usunac kolejki komunikato w.\n");
     }
@@ -425,7 +417,6 @@ pthread_mutex_lock(&station_mutex);
     // Zwalnianie semaforów
     sem_destroy(&platform_sem);
     sem_destroy(&chairlift_sem);
-    sem_destroy(&lift_control_sem);
     sem_destroy(&vip_chairlift_sem);
     for (int i = 0; i < NUM_GATES; i++) {
         sem_destroy(&gates[i]);
@@ -437,67 +428,66 @@ pthread_mutex_lock(&station_mutex);
 }
 
 int main() {
-	signal(SIGINT, cleanup);
-    signal(SIGUSR2, statistic_signal_handler); 
-	srand(time(NULL));
-// Inicjalizacja semaforów dla bramek z obsługą błędów
-for (int i = 0; i < NUM_GATES; i++) {
-    if (sem_init(&gates[i], 0, 0) == -1) {
-        fprintf(stderr, "Blad: Nie udalo sie zainicjalizowac semafora dla bramki #%d.\n", i);
-        // Zwalnianie wczesniej zainicjalizowanych semaforów
-        for (int j = 0; j < i; j++) {
-            sem_destroy(&gates[j]);
-        }
-        exit(EXIT_FAILURE);
-    }
 
-    if (sem_init(&gate_ready[i], 0, 0) == -1) {
-        fprintf(stderr, "Błąd: Nie udało się zainicjalizować semafora 'gate_ready' dla bramki #%d.\n", i);
-        // Zwalnianie wcześniej zainicjalizowanych semaforów
-        sem_destroy(&gates[i]);
-        for (int j = 0; j < i; j++) {
-            sem_destroy(&gates[j]);
-            sem_destroy(&gate_ready[j]);
-        }
-        exit(EXIT_FAILURE);
-    }
-}
+	signal(SIGINT, cleanup);
+	signal(SIGUSR2, statistic_signal_handler); 
+	srand(time(NULL));
+
+	// Inicjalizacja semaforów dla bramek z obsługą błędów
+	for (int i = 0; i < NUM_GATES; i++) {
+    		if (sem_init(&gates[i], 0, 0) == -1) {
+       	
+		fprintf(stderr, "Blad: Nie udalo sie zainicjalizowac semafora dla bramki #%d.\n", i);
+        	// Zwalnianie wczesniej zainicjalizowanych semaforów
+        	for (int j = 0; j < i; j++) {
+            		sem_destroy(&gates[j]);
+        	}
+        	exit(EXIT_FAILURE);
+   		}
+
+	if(sem_init(&gate_ready[i], 0, 0) == -1) {
+		fprintf(stderr, "Blad: Nie udalo się zainicjalizowac semafora 'gate_ready' dla bramki #%d.\n", i);
+		// Zwalnianie wcześniej zainicjalizowanych semaforów
+		sem_destroy(&gates[i]);
+		for (int j = 0; j < i; j++) {
+		sem_destroy(&gates[j]);
+		sem_destroy(&gate_ready[j]);
+		}
+       	exit(EXIT_FAILURE);
+    		}
+	}
 
 
     // Inicjalizacja semaforów z obsługą błędów
 if (sem_init(&platform_sem, 0, MAX_PEOPLE_ON_PLATFORM) == -1) {
-    fprintf(stderr, "Błąd: Nie udało się zainicjalizować semafora platformy.\n");
+    fprintf(stderr, "Blad: Nie udalo sie zainicjalizowac semafora platformy.\n");
     exit(EXIT_FAILURE);
 }
 
 if (sem_init(&chairlift_sem, 0, MAX_CHAIRS * MAX_PEOPLE_ON_CHAIR) == -1) {
-    fprintf(stderr, "Błąd: Nie udało się zainicjalizować semafora kolejki linowej.\n");
-    sem_destroy(&platform_sem); // Usunięcie już zainicjalizowanego semafora
+    fprintf(stderr, "Blad: Nie udalo sie zainicjalizowac semafora kolejki linowej.\n");
+    sem_destroy(&platform_sem); // Usuniecie już zainicjalizowanego semafora
     exit(EXIT_FAILURE);
 }
 
-// Inicjalizacja semafora lift_control_sem z obsługą błędów
-if (sem_init(&lift_control_sem, 0, 1) == -1) {
-    fprintf(stderr, "Błąd: Nie udało się zainicjalizować semafora lift_control_sem.\n");
-    exit(EXIT_FAILURE);
-}
+
 
 // Inicjalizacja semafora vip_chairlift_sem z obsługą błędów
 if (sem_init(&vip_chairlift_sem, 0, MAX_CHAIRS * MAX_PEOPLE_ON_CHAIR) == -1) {
-    fprintf(stderr, "Błąd: Nie udało się zainicjalizować semafora vip_chairlift_sem.\n");
-    sem_destroy(&lift_control_sem); // Zwalnianie wcześniejszego semafora
+    fprintf(stderr, "Blad: Nie udalo sie zainicjalizowac semafora vip_chairlift_sem.\n");
+    sem_destroy(&chairlift_sem);
     exit(EXIT_FAILURE);
 }
 
     // Inicjalizacja pamięci dzielonej
-    int shm_id = shmget(IPC_PRIVATE, sizeof(int) * 1000, IPC_CREAT | 0666); // Zakładamy maksymalnie 1000 narciarzy
+    int shm_id = shmget(IPC_PRIVATE, sizeof(int) * 1000, IPC_CREAT | 0600); // Zakładamy maksymalnie 1000 narciarzy
     if (shm_id == -1) {
-        fprintf(stderr, "Błąd: Nie udało się utworzyć pamięci dzielonej.\n");
-        exit(EXIT_FAILURE); // Zakończenie programu w przypadku błędu
+        fprintf(stderr, "Blad: Nie udalo sie utworzyc pamieci dzielonej.\n");
+        exit(EXIT_FAILURE); // Zakonczenie programu w przypadku bledu
     }    
     shared_usage = shmat(shm_id, NULL, 0);
     if (shared_usage == (void*)-1) {
-        fprintf(stderr, "Błąd: Nie udało się przydzielić pamięci dzielonej.\n");
+        fprintf(stderr, "Blad: Nie udalo sie przydzielic pamieci dzielonej.\n");
         shmctl(shm_id, IPC_RMID, NULL); // Usunięcie segmentu pamięci
         exit(EXIT_FAILURE);
     }
@@ -508,11 +498,11 @@ if (sem_init(&vip_chairlift_sem, 0, MAX_CHAIRS * MAX_PEOPLE_ON_CHAIR) == -1) {
     }
 
 // Inicjalizacja kolejki komunikatów z obsługą błędów
-msgid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
-if (msgid == -1) {
-    fprintf(stderr, "Błąd: Nie udało się utworzyć kolejki komunikatów.\n");
-    exit(EXIT_FAILURE); // Zakończenie programu w przypadku błędu
-}
+	msgid = msgget(IPC_PRIVATE, 0600 | IPC_CREAT);
+	if (msgid == -1) {
+   	 fprintf(stderr, "Blad: Nie udalo sie utworzyc kolejki komunikatow.\n");
+    	exit(EXIT_FAILURE); // Zakończenie programu w przypadku błędu
+	}	
 
     pthread_t time_thread, lift_shutdown;
     pthread_create(&time_thread, NULL, time_simulation_thread, NULL);
@@ -561,6 +551,7 @@ pthread_create(&lift_shutdown, NULL, lift_shutdown_thread, NULL);
 	    free(responder_id); // Zwolnienie pamięci w przypadku błędu
 	    exit(EXIT_FAILURE);
 	}
+
     // Tworzenie wątków narciarzy w nieskończonej pętli
     int skier_id = 0;
     while (is_station_open) {
@@ -578,11 +569,12 @@ pthread_create(&lift_shutdown, NULL, lift_shutdown_thread, NULL);
    	 continue; // Przejście do następnego narciarza
 	}
 	skier->is_guardian = skier->age >= 18 && skier->age <= 65;
-        skier->is_child = skier->age >= 4 && skier->age <= 8;
+       skier->is_child = skier->age >= 4 && skier->age <= 8;
 	skier->has_guardian = skier->is_child ? (rand() % 2) : -1;
 	skier->other_guarded_children_count = (skier->skier_id > 0) ? (rand() % skier->skier_id) : 0;
-        pthread_t skier_thread_id;
-        pthread_create(&skier_thread_id, NULL, skier_thread, skier);
+       
+	pthread_t skier_thread_id;
+       pthread_create(&skier_thread_id, NULL, skier_thread, skier);
  int sleep_time_ms = (rand() % 3000) + 500; // Od 500 ms do 3 sekund
     usleep(sleep_time_ms * 1000); // Zamiana milisekund na mikrosekundy
         skier_id++;
@@ -598,10 +590,11 @@ pthread_create(&lift_shutdown, NULL, lift_shutdown_thread, NULL);
     pthread_join(worker_thread_id, NULL);
     pthread_join(responder_thread_id, NULL);
     pthread_join(skier_thread_id, NULL);
+	
         // Zakonczenie pracy bramek
-for (int i = 0; i < NUM_GATES; i++) {
-    sem_post(&gates[i]); // Odblokowanie semafor      w bramek
-}
+	for (int i = 0; i < NUM_GATES; i++) {
+    	sem_post(&gates[i]); // Odblokowanie semaforow bramek
+	}
 	
 
     // Wyświetlenie raportu po zakończeniu wszystkich wątków
@@ -619,9 +612,8 @@ for (int i = 0; i < NUM_GATES; i++) {
         sem_destroy(&gates[i]);
 	    sem_destroy(&gate_ready[i]); 
     }
+
     // Zwolnienie pamięci dzielonej
-    //shmdt(shared_usage);
-   // shmctl(shm_id, IPC_RMID, NULL);
 	
     if (shmdt(shared_usage) == -1) {
         fprintf(stderr, "Blad: Nie udało się odłączyć pamięci dzielonej.\n");
@@ -630,13 +622,14 @@ for (int i = 0; i < NUM_GATES; i++) {
         fprintf(stderr, "Blad: Nie udało się usunąć segmentu pamięci dzielonej.\n");
     }
 
-// Usunięcie kolejki komunikatów
-if (msgctl(msgid, IPC_RMID, NULL) == -1) {
-    fprintf(stderr, "Błąd: Nie udało się usunąć kolejki komunikatów.\n");
-}
-    sem_destroy(&platform_sem);
-    sem_destroy(&chairlift_sem);
-
+	
+	// Usunięcie kolejki komunikatów
+	if (msgctl(msgid, IPC_RMID, NULL) == -1) {
+  	  fprintf(stderr, "Błąd: Nie udało się usunąć kolejki komunikatów.\n");
+	}
+   	 sem_destroy(&platform_sem);
+  	  sem_destroy(&chairlift_sem);
+	
     printf("Program zakończył działanie.\n");
     return 0;
 }

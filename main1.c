@@ -5,51 +5,82 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
 
-#define MAX_CHAIRS 40
-#define MAX_SKIER_COUNT 120
-#define MAX_PEOPLE_ON_PLATFORM 50
+#define MAX_CHAIRS 40         // Liczba krzesełek
+#define MAX_PEOPLE_ON_CHAIR 3 // Liczba miejsc na jednym krzesełku
+#define MAX_PEOPLE_ON_PLATFORM 50 // Maksymalna liczba osób na peronie
+#define NUM_WORKERS 2         // Liczba pracowników
 #define OPENING_HOUR 8
 #define CLOSING_HOUR 10
 #define SIMULATION_STEP 1 // 1 sekunda = 1 minuta w symulacji
 
-volatile int simulated_time = 0; // Czas symulowany w minutach
+// Symulowany czas
+volatile int simulated_time = 0; 
 volatile bool is_station_open = true;
 volatile bool is_lift_running = true;
-volatile int active_skiers = 0;
+volatile int people_on_lift = 0;
 
+// Semafory
 sem_t platform_sem;
 sem_t chairlift_sem;
-sem_t vip_platform_sem;
 
-pthread_mutex_t station_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Mutexy i zmienne warunkowe
 pthread_mutex_t lift_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t station_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t lift_condition = PTHREAD_COND_INITIALIZER;
-pthread_cond_t station_close_cond = PTHREAD_COND_INITIALIZER;
 
+// Struktura karnetu (biletu)
 typedef struct {
-    int ticket_id;
-    int usage_count;
-    bool is_vip;
-    int expiry_time; // Czas ważności karnetu w minutach
+    int ticket_id;      // ID karnetu
+    int usage_count;    // Liczba wykorzystanych przejazdów
+    bool is_vip;        // Czy bilet jest VIP?
+    int expiry_time;    // Czas ważności karnetu w minutach
 } Ticket;
 
+// Struktura narciarza
 typedef struct {
-    int skier_id;
-    int age;
-    bool is_vip;
-    bool is_guardian;
-    int children_count;
-    int guardian_id;
-    Ticket* ticket;
-    bool is_child;
+    int skier_id;       // ID narciarza
+    int age;            // Wiek
+    bool is_vip;        // Czy VIP
+    bool is_guardian;   // Czy opiekun
+    int children_count; // Liczba dzieci pod opieką
+    int guardian_id;    // ID opiekuna (dla dzieci)
+    Ticket* ticket;     // Wskaźnik na bilet
+    bool is_child;      // Czy narciarz jest dzieckiem
 } Skier;
 
-void perror_exit(const char* message) {
-    perror(message);
-    exit(EXIT_FAILURE);
+// Struktura komunikatu dla kolejki komunikatów
+typedef struct {
+    long message_type;  // Typ komunikatu
+    int skier_id;       // ID narciarza
+    int age;            // Wiek narciarza
+    bool is_vip;        // Czy narciarz jest VIP
+} GateMessage;
+
+// Kolejka komunikatów
+key_t gate_key;
+int gate_msg_queue;
+
+// Inicjalizacja kolejki komunikatów
+void init_message_queue() {
+    gate_key = ftok("ski_station", 65);
+    gate_msg_queue = msgget(gate_key, 0666 | IPC_CREAT);
+    if (gate_msg_queue == -1) {
+        perror("Nie udało się utworzyć kolejki komunikatów");
+        exit(EXIT_FAILURE);
+    }
 }
 
+// Usuwanie kolejki komunikatów
+void cleanup_message_queue() {
+    if (msgctl(gate_msg_queue, IPC_RMID, NULL) == -1) {
+        perror("Nie udało się usunąć kolejki komunikatów");
+    }
+}
+
+// Zakup biletu
 Ticket* purchase_ticket(int skier_id, int age) {
     Ticket* ticket = malloc(sizeof(Ticket));
     ticket->ticket_id = skier_id;
@@ -57,7 +88,7 @@ Ticket* purchase_ticket(int skier_id, int age) {
 
     int ticket_type = rand() % 4;
     if (ticket_type == 3) {
-        ticket->expiry_time = (CLOSING_HOUR - OPENING_HOUR) * 60; // Dzienny
+        ticket->expiry_time = (CLOSING_HOUR - OPENING_HOUR) * 60; // Bilet dzienny
     } else {
         ticket->expiry_time = (ticket_type + 1) * 60; // Tk1, Tk2, Tk3
     }
@@ -71,6 +102,7 @@ Ticket* purchase_ticket(int skier_id, int age) {
     return ticket;
 }
 
+// Funkcja zatrzymująca kolejkę linową
 void stop_lift(int worker_id) {
     pthread_mutex_lock(&lift_mutex);
     if (is_lift_running) {
@@ -80,6 +112,7 @@ void stop_lift(int worker_id) {
     pthread_mutex_unlock(&lift_mutex);
 }
 
+// Funkcja wznawiająca kolejkę linową
 void resume_lift(int worker_id) {
     pthread_mutex_lock(&lift_mutex);
     if (!is_lift_running) {
@@ -90,44 +123,31 @@ void resume_lift(int worker_id) {
     pthread_mutex_unlock(&lift_mutex);
 }
 
+// Funkcja wątku pracownika
+void* worker_thread(void* arg) {
+    int worker_id = *(int*)arg;
+    free(arg);
+
+    while (is_station_open) {
+        if (rand() % 10 == 0) { // 10% szans na zatrzymanie kolejki
+            stop_lift(worker_id);
+            sleep(2); // Symulacja problemu
+            resume_lift(worker_id);
+        }
+        sleep(1); // Czas pracy pracownika
+    }
+
+    printf("[Pracownik #%d] Kończy pracę.\n", worker_id);
+    return NULL;
+}
+
+// Wątek narciarza
 void* skier_thread(void* arg) {
     Skier* skier = (Skier*)arg;
 
-    pthread_mutex_lock(&station_mutex);
-    active_skiers++;
-    pthread_mutex_unlock(&station_mutex);
-
-    if (skier->is_child) {
-        printf("Dziecko #%d w wieku 4–8 lat wymaga opiekuna.\n", skier->skier_id);
-        if (skier->guardian_id == -1) {
-            printf("Dziecko #%d nie ma przypisanego opiekuna i nie może wejść.\n", skier->skier_id);
-            pthread_mutex_lock(&station_mutex);
-            active_skiers--;
-            pthread_mutex_unlock(&station_mutex);
-            free(skier);
-            return NULL;
-        }
-        printf("Dziecko #%d jest pod opieką narciarza #%d.\n", skier->skier_id, skier->guardian_id);
-    }
-
     while (simulated_time < skier->ticket->expiry_time && is_station_open) {
-        if (!skier->is_child) {
-            printf("Narciarz #%d wchodzi na peron.\n", skier->skier_id);
-        } else {
-            printf("Dziecko #%d wchodzi na peron.\n", skier->skier_id);
-        }
-
-        if (skier->ticket->is_vip) {
-            sem_wait(&vip_platform_sem);
-            printf("Narciarz #%d (VIP) jest na platformie.\n", skier->skier_id);
-        } else {
-            sem_wait(&platform_sem);
-            printf("Narciarz #%d jest na platformie.\n", skier->skier_id);
-        }
-
         pthread_mutex_lock(&lift_mutex);
         while (!is_lift_running) {
-            printf("Narciarz #%d czeka na wznowienie kolejki.\n", skier->skier_id);
             pthread_cond_wait(&lift_condition, &lift_mutex);
         }
         pthread_mutex_unlock(&lift_mutex);
@@ -141,48 +161,21 @@ void* skier_thread(void* arg) {
         sleep(rand() % 3 + 1);
 
         skier->ticket->usage_count++;
-
-        if (skier->ticket->is_vip) {
-            sem_post(&vip_platform_sem);
-        } else {
-            sem_post(&platform_sem);
-        }
     }
 
     printf("Narciarz #%d kończy dzień na stacji.\n", skier->skier_id);
-
-    pthread_mutex_lock(&station_mutex);
-    active_skiers--;
-    pthread_cond_signal(&station_close_cond);
-    pthread_mutex_unlock(&station_mutex);
-
+    free(skier->ticket);
     free(skier);
     return NULL;
 }
 
-void* worker_thread(void* arg) {
-    int worker_id = *(int*)arg;
-    free(arg);
-
-    while (is_station_open) {
-        if (rand() % 10 == 0) {
-            stop_lift(worker_id);
-            sleep(2);
-            resume_lift(worker_id);
-        }
-        sleep(1);
-    }
-
-    printf("[Pracownik #%d] Kończy pracę.\n", worker_id);
-    return NULL;
-}
-
+// Symulacja czasu
 void* time_simulation_thread(void* arg) {
     int simulation_duration = (CLOSING_HOUR - OPENING_HOUR) * 60;
 
     while (simulated_time < simulation_duration) {
         sleep(SIMULATION_STEP);
-        simulated_time+=2;
+        simulated_time += 2; // 1 sekunda = 2 minuty
         if (simulated_time % 60 == 0) {
             printf("Symulowany czas: %d godzin minęło.\n", simulated_time / 60);
         }
@@ -190,7 +183,6 @@ void* time_simulation_thread(void* arg) {
 
     pthread_mutex_lock(&station_mutex);
     is_station_open = false;
-    pthread_cond_broadcast(&lift_condition);
     pthread_mutex_unlock(&station_mutex);
 
     printf("Stacja zamyka się.\n");
@@ -199,75 +191,47 @@ void* time_simulation_thread(void* arg) {
 
 int main() {
     srand(time(NULL));
-
     sem_init(&platform_sem, 0, MAX_PEOPLE_ON_PLATFORM);
-    sem_init(&vip_platform_sem, 0, 10);
-    sem_init(&chairlift_sem, 0, MAX_CHAIRS);
+    sem_init(&chairlift_sem, 0, MAX_CHAIRS * MAX_PEOPLE_ON_CHAIR);
 
-    pthread_t skier_threads[MAX_SKIER_COUNT * 2];
-    pthread_t worker1, worker2, time_thread;
+    pthread_t time_thread, worker_threads[NUM_WORKERS];
+    pthread_t skier_threads[MAX_PEOPLE_ON_PLATFORM];
 
-    int skier_count = 0;
-    int child_count = 0;
-    int thread_index = 0;
+    init_message_queue();
 
-    for (int i = 1; i <= 2; i++) {
+    pthread_create(&time_thread, NULL, time_simulation_thread, NULL);
+
+    // Tworzenie wątków pracowników
+    for (int i = 0; i < NUM_WORKERS; i++) {
         int* worker_id = malloc(sizeof(int));
-        *worker_id = i;
-        if (pthread_create((i == 1 ? &worker1 : &worker2), NULL, worker_thread, worker_id) != 0) {
-            perror_exit("Nie udało się utworzyć wątku pracownika");
-        }
+        *worker_id = i + 1;
+        pthread_create(&worker_threads[i], NULL, worker_thread, worker_id);
     }
 
-    if (pthread_create(&time_thread, NULL, time_simulation_thread, NULL) != 0) {
-        perror_exit("Nie udało się utworzyć wątku czasu symulacji");
-    }
-
-    for (int i = 0; i < MAX_SKIER_COUNT; i++) {
+    // Tworzenie wątków narciarzy
+    for (int i = 0; i < MAX_PEOPLE_ON_PLATFORM; i++) {
         Skier* skier = malloc(sizeof(Skier));
-        skier->skier_id = ++skier_count;
+        skier->skier_id = i + 1;
         skier->age = rand() % 75 + 4;
         skier->ticket = purchase_ticket(skier->skier_id, skier->age);
         skier->is_guardian = skier->age >= 18 && skier->age <= 65;
-        skier->children_count = 0;
-        skier->guardian_id = -1;
         skier->is_child = false;
 
-        if (skier->is_guardian) {
-            int num_children = rand() % 3;
-            for (int j = 0; j < num_children; j++) {
-                Skier* child = malloc(sizeof(Skier));
-                child->skier_id = ++child_count;
-                child->age = rand() % 5 + 4;
-                child->ticket = purchase_ticket(child->skier_id, child->age);
-                child->guardian_id = skier->skier_id;
-                child->is_child = true;
-
-                printf("Narciarz #%d przyjechał z dzieckiem #%d.\n", skier->skier_id, child->skier_id);
-
-                if (pthread_create(&skier_threads[thread_index++], NULL, skier_thread, child) != 0) {
-                    perror_exit("Nie udało się utworzyć wątku dla dziecka");
-                }
-            }
-        }
-
-        if (pthread_create(&skier_threads[thread_index++], NULL, skier_thread, skier) != 0) {
-            perror_exit("Nie udało się utworzyć wątku dla narciarza");
-        }
-
+        pthread_create(&skier_threads[i], NULL, skier_thread, skier);
         usleep(rand() % 500000);
     }
 
-    for (int i = 0; i < thread_index; i++) {
+    for (int i = 0; i < MAX_PEOPLE_ON_PLATFORM; i++) {
         pthread_join(skier_threads[i], NULL);
     }
 
     pthread_join(time_thread, NULL);
-    pthread_join(worker1, NULL);
-    pthread_join(worker2, NULL);
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        pthread_join(worker_threads[i], NULL);
+    }
 
+    cleanup_message_queue();
     sem_destroy(&platform_sem);
-    sem_destroy(&vip_platform_sem);
     sem_destroy(&chairlift_sem);
 
     printf("Program zakończył działanie.\n");

@@ -1,4 +1,4 @@
- #include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -7,11 +7,11 @@
 #include <time.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/msg.h>
 
 #define MAX_CHAIRS 40         // Liczba krzesełek
 #define MAX_PEOPLE_ON_CHAIR 3 // Liczba miejsc na jednym krzesełku
 #define MAX_PEOPLE_ON_PLATFORM 50 // Maksymalna liczba osób na peronie
-#define NUM_WORKERS 2         // Liczba pracowników
 #define OPENING_HOUR 8
 #define CLOSING_HOUR 10
 #define SIMULATION_STEP 1 // 1 sekunda = 1 minuta w symulacji
@@ -30,11 +30,20 @@ volatile int people_on_lift = 0;
 // Semafory
 sem_t platform_sem;
 sem_t chairlift_sem;
+sem_t lift_control_sem;
 
 // Mutexy i zmienne warunkowe
 pthread_mutex_t lift_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t station_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t lift_condition = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t chairlift_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t lift_operation_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex do synchronizacji operacji
+
+// Struktura komunikatu
+typedef struct {
+    long message_type; // Typ komunikatu
+    char message_text[100]; // Treść komunikatu
+} Message;
 
 // Struktura karnetu (biletu)
 typedef struct {
@@ -58,6 +67,9 @@ typedef struct {
 
 // Wskaźnik do pamięci dzielonej
 int* shared_usage;
+
+// ID kolejki komunikatów
+int msgid;
 
 // Zakup biletu
 Ticket* purchase_ticket(int skier_id, int age) {
@@ -87,19 +99,41 @@ void stop_lift(int worker_id) {
     if (is_lift_running) {
         is_lift_running = false;
         printf("Kolejka linowa została zatrzymana przez pracownika #%d.\n", worker_id);
+        pthread_cond_broadcast(&lift_condition); // Powiadomienie wszystkich o zatrzymaniu
     }
     pthread_mutex_unlock(&lift_mutex);
 }
 
-// Funkcja wznawiająca kolejkę linową
 void resume_lift(int worker_id) {
     pthread_mutex_lock(&lift_mutex);
     if (!is_lift_running) {
         is_lift_running = true;
         printf("Kolejka linowa została wznowiona przez pracownika #%d.\n", worker_id);
-        pthread_cond_broadcast(&lift_condition); // Powiadom wszystkich narciarzy
+        pthread_cond_broadcast(&lift_condition); // Powiadomienie wszystkich o wznowieniu
     }
     pthread_mutex_unlock(&lift_mutex);
+}
+
+// Symulacja czasu
+void* time_simulation_thread(void* arg) {
+    int simulation_duration = (CLOSING_HOUR - OPENING_HOUR) * 60;
+
+    while (simulated_time < simulation_duration) {
+        sleep(SIMULATION_STEP);
+        simulated_time += 2; // 1 sekunda = 2 minuty
+        if (simulated_time % 60 == 0) {
+            printf("Symulowany czas: %d godzin min   ^y   ^bo.\n", simulated_time / 60);
+        }
+    }
+
+    pthread_mutex_lock(&station_mutex);
+    is_station_open = false;
+    pthread_mutex_unlock(&station_mutex);
+
+    printf("Stacja zamyka si   ^y.\n");
+    sleep(5);  // Czas na wy   ^b   ^eczenie kolejki
+
+    return NULL;
 }
 
 // Funkcja obsługi dzieci i opiekunów
@@ -114,6 +148,7 @@ bool can_ski(Skier* skier) {
 }
 
 // Funkcja wątku narciarza
+// Funkcja wątku narciarza
 void* skier_thread(void* arg) {
     Skier* skier = (Skier*)arg;
 
@@ -124,31 +159,56 @@ void* skier_thread(void* arg) {
     }
 
     while (simulated_time < skier->ticket->expiry_time && is_station_open) {
+        // Oczekiwanie na miejsce na platformie
+        sem_wait(&platform_sem);
+        printf("Narciarz #%d wchodzi na platformę.\n", skier->skier_id);
+
         pthread_mutex_lock(&lift_mutex);
         while (!is_lift_running) { // Czekaj na wznowienie kolejki
             printf("Narciarz #%d czeka na wznowienie kolejki.\n", skier->skier_id);
-            pthread_cond_wait(&lift_condition, &lift_mutex); // Czekaj na sygnał od pracownika
+            pthread_cond_wait(&lift_condition, &lift_mutex);
         }
         pthread_mutex_unlock(&lift_mutex);
 
-        if (skier->ticket->is_vip) {
-            sem_wait(&chairlift_sem);
-            printf("[VIP] Narciarz #%d wsiada na krzesełko.\n", skier->skier_id);
-        } else {
-            sem_wait(&platform_sem);
-            sem_wait(&chairlift_sem);
-            printf("Narciarz #%d wsiada na krzesełko.\n", skier->skier_id);
-        }
+// Narciarz wsiada na krzesełko
+sem_wait(&chairlift_sem);
+pthread_mutex_lock(&lift_operation_mutex);
+while (!is_lift_running) {
+    printf("Narciarz #%d czeka na wznowienie kolejki przed wsiadaniem.\n", skier->skier_id);
+    pthread_cond_wait(&lift_condition, &lift_operation_mutex);
+}
+printf("Narciarz #%d wsiada na krzesełko.\n", skier->skier_id);
+pthread_mutex_unlock(&lift_operation_mutex);
 
-        sleep(rand() % 3 + 1);  // Czas jazdy
-        skier->ticket->usage_count++;
+// Symulacja jazdy
+int ride_time = rand() % 3 + 1; // Czas jazdy w sekundach
+for (int t = 0; t < ride_time; t++) {
+    pthread_mutex_lock(&lift_operation_mutex);
+    while (!is_lift_running) {
+        printf("Narciarz #%d zatrzymuje się na krzesełku i czeka na wznowienie.\n", skier->skier_id);
+        pthread_cond_wait(&lift_condition, &lift_operation_mutex);
+    }
+    pthread_mutex_unlock(&lift_operation_mutex);
+    sleep(1); // Symulacja jednej sekundy jazdy
+}
 
-        // Zapis zjazdu w pamięci dzielonej
-        shared_usage[skier->skier_id]++;
+// Narciarz kończy jazdę
+pthread_mutex_lock(&lift_operation_mutex);
+while (!is_lift_running) {
+    printf("Narciarz #%d czeka na wznowienie kolejki przed zejściem.\n", skier->skier_id);
+    pthread_cond_wait(&lift_condition, &lift_operation_mutex);
+}
+printf("Narciarz #%d kończy jazdę krzesełkiem i schodzi z platformy.\n", skier->skier_id);
+pthread_mutex_unlock(&lift_operation_mutex);
 
-        sem_post(&chairlift_sem);
-        sem_post(&platform_sem);
+skier->ticket->usage_count++;
 
+// Zapis zjazdu w pamięci dzielonej
+shared_usage[skier->skier_id]++;
+sem_post(&chairlift_sem); // Zwolnienie miejsca na krzesełku
+sem_post(&platform_sem);  // Zwolnienie miejsca na platformie
+
+        // Wybór trasy i czas przejazdu
         int track_choice = rand() % 3;  // Wybór trasy
         if (track_choice == 0) {
             sleep(T1_TIME);
@@ -168,35 +228,24 @@ void* skier_thread(void* arg) {
     return NULL;
 }
 
-// Symulacja czasu
-void* time_simulation_thread(void* arg) {
-    int simulation_duration = (CLOSING_HOUR - OPENING_HOUR) * 60;
-
-    while (simulated_time < simulation_duration) {
-        sleep(SIMULATION_STEP);
-        simulated_time += 2; // 1 sekunda = 2 minuty
-        if (simulated_time % 60 == 0) {
-            printf("Symulowany czas: %d godzin minęło.\n", simulated_time / 60);
-        }
-    }
-
-    pthread_mutex_lock(&station_mutex);
-    is_station_open = false;
-    pthread_mutex_unlock(&station_mutex);
-
-    printf("Stacja zamyka się.\n");
-    sleep(5);  // Czas na wyłączenie kolejki
-
-    return NULL;
-}
 void* worker_thread(void* arg) {
     int worker_id = *(int*)arg;
     free(arg);
 
     while (is_station_open) {
         if (rand() % 10 == 0) { // 10% szans na zatrzymanie kolejki
+            Message msg;
+            msg.message_type = 1; // Prośba o gotowość
+            snprintf(msg.message_text, sizeof(msg.message_text), "Pracownik #%d zatrzymuje kolejkę.", worker_id);
+
             stop_lift(worker_id);
-            sleep(2); // Symulacja problemu, kolejka zatrzymana na 2 sekundy
+
+            printf("Pracownik #%d wysyła zapytanie do pracownika #%d o gotowość.\n", worker_id, 2);
+            msgsnd(msgid, &msg, sizeof(msg), 0);
+
+            msgrcv(msgid, &msg, sizeof(msg), 2, 0); // Czekaj na odpowiedź od Pracownika 2
+            printf("Pracownik #%d otrzymał odpowiedź: %s\n", worker_id, msg.message_text);
+
             resume_lift(worker_id);
         }
         sleep(1); // Czas pracy pracownika
@@ -206,46 +255,94 @@ void* worker_thread(void* arg) {
     return NULL;
 }
 
+void* responder_thread(void* arg) {
+    int worker_id = *(int*)arg;
+    free(arg);
+
+    while (is_station_open) {
+        Message msg;
+        msgrcv(msgid, &msg, sizeof(msg), 1, 0);
+
+        // Sprawdź, czy to sygnał zakończenia
+        if (strcmp(msg.message_text, "END") == 0) {
+            printf("[Pracownik #%d] Kończy pracę na podstawie sygnału zakończenia.\n", worker_id);
+            break;
+        }
+
+        printf("Pracownik #%d otrzymał komunikat: %s\n", worker_id, msg.message_text);
+        sleep(2); // Symulacja sprawdzania gotowości
+
+        msg.message_type = 2; // Odpowiedź do Pracownika 1
+        snprintf(msg.message_text, sizeof(msg.message_text), "Pracownik #%d gotowy do wznowienia.", worker_id);
+        msgsnd(msgid, &msg, sizeof(msg), 0);
+    }
+
+    return NULL;
+}
 
 int main() {
     srand(time(NULL));
     sem_init(&platform_sem, 0, MAX_PEOPLE_ON_PLATFORM);
     sem_init(&chairlift_sem, 0, MAX_CHAIRS * MAX_PEOPLE_ON_CHAIR);
+    sem_init(&lift_control_sem, 0, 1); // Semafor początkowo odblokowany
 
     // Inicjalizacja pamięci dzielonej
-    int shm_id = shmget(IPC_PRIVATE, sizeof(int) * MAX_PEOPLE_ON_PLATFORM, IPC_CREAT | 0666);
+    int shm_id = shmget(IPC_PRIVATE, sizeof(int) * 1000, IPC_CREAT | 0666); // Zakładamy maksymalnie 1000 narciarzy
     shared_usage = shmat(shm_id, NULL, 0);
-    for (int i = 0; i < MAX_PEOPLE_ON_PLATFORM; i++) {
+    for (int i = 0; i < 1000; i++) {
         shared_usage[i] = 0;
     }
 
-    pthread_t time_thread, skier_threads[MAX_PEOPLE_ON_PLATFORM];
+    // Inicjalizacja kolejki komunikatów
+    msgid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
 
+    pthread_t time_thread;
     pthread_create(&time_thread, NULL, time_simulation_thread, NULL);
 
-    // Tworzenie wątków narciarzy
-    for (int i = 0; i < MAX_PEOPLE_ON_PLATFORM; i++) {
+    // Tworzenie wątków pracowników
+    pthread_t worker_thread_id, responder_thread_id;
+    int* worker_id = malloc(sizeof(int));
+    *worker_id = 1;
+    pthread_create(&worker_thread_id, NULL, worker_thread, worker_id);
+
+    int* responder_id = malloc(sizeof(int));
+    *responder_id = 2;
+    pthread_create(&responder_thread_id, NULL, responder_thread, responder_id);
+
+    // Tworzenie wątków narciarzy w nieskończonej pętli
+    int skier_id = 0;
+    while (is_station_open) {
         Skier* skier = malloc(sizeof(Skier));
-        skier->skier_id = i;
+        skier->skier_id = skier_id;
         skier->age = rand() % 75 + 4;
         skier->ticket = purchase_ticket(skier->skier_id, skier->age);
         skier->is_guardian = skier->age >= 18 && skier->age <= 65;
         skier->is_child = skier->age >= 4 && skier->age <= 8;
-        skier->guardian_id = skier->is_child ? (rand() % (i + 1)) : -1;
+        skier->guardian_id = skier->is_child ? (rand() % (skier_id + 1)) : -1;
 
-        pthread_create(&skier_threads[i], NULL, skier_thread, skier);
-        usleep(rand() % 500000);
-    }
+        pthread_t skier_thread_id;
+        pthread_create(&skier_thread_id, NULL, skier_thread, skier);
+        usleep(rand() % 500000); // Nowy narciarz co 0.5 sekundy
 
-    for (int i = 0; i < MAX_PEOPLE_ON_PLATFORM; i++) {
-        pthread_join(skier_threads[i], NULL);
+        skier_id++;
     }
 
     pthread_join(time_thread, NULL);
 
+    // Wysłanie sygnału zakończenia do responder_thread
+    Message end_msg;
+    end_msg.message_type = 1;
+    snprintf(end_msg.message_text, sizeof(end_msg.message_text), "END");
+    msgsnd(msgid, &end_msg, sizeof(end_msg), 0);
+    pthread_join(worker_thread_id, NULL);
+    pthread_join(responder_thread_id, NULL);
+
+	
+
     // Wyświetlenie raportu po zakończeniu wszystkich wątków
+	sleep(5);
     printf("\n[Raport dzienny z pamięci dzielonej]\n");
-    for (int i = 0; i < MAX_PEOPLE_ON_PLATFORM; i++) {
+    for (int i = 0; i < skier_id; i++) {
         if (shared_usage[i] > 0) {
             printf("Narciarz #%d wykonał %d zjazdów.\n", i, shared_usage[i]);
         }
@@ -254,6 +351,9 @@ int main() {
     // Zwolnienie pamięci dzielonej
     shmdt(shared_usage);
     shmctl(shm_id, IPC_RMID, NULL);
+
+    // Usunięcie kolejki komunikatów
+    msgctl(msgid, IPC_RMID, NULL);
 
     sem_destroy(&platform_sem);
     sem_destroy(&chairlift_sem);
